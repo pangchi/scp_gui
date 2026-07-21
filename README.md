@@ -1,82 +1,71 @@
-# Dual Pane SCP Explorer
+# SCP GUI
 
-A lightweight desktop file manager for transferring files between your local machine and a remote server over SSH/SFTP. Built with Python and Tkinter, it provides a familiar dual-pane interface similar to classic file managers like WinSCP or FileZilla.
+A FileZilla-style two-panel file manager built in Python / Tkinter, for transferring files to/from a remote host over SSH (SCP/SFTP).
 
-## Features
+```
+Your PC ──── SSH / SFTP (port 22) ────▶ Remote Host
+```
 
-- Dual-pane view showing local and remote filesystems side by side
-- Browse directories on both local and remote systems
-- Upload and download files with a single click
-- Drag-and-drop file upload from your desktop or file manager
-- Delete files on the remote server
-- Sortable columns (name, size, type, last modified)
-- Folder and file icons for quick visual distinction
-- Configuration via a simple `config.ini` file
+Same dark UI theme, panel layout, drag-and-drop, and transfer log as `proxy_ftp`, trimmed down to a single hop (no Pi relay) — just local ↔ remote over SSH.
 
 ## Requirements
 
-- Python 3.7+
-- The following Python packages:
-  - `paramiko`
-  - `tkinterdnd2`
+| Requirement | Notes |
+|---|---|
+| Python 3.10+ | |
+| [paramiko](https://www.paramiko.org/) | `pip install paramiko` |
+| Tkinter | Bundled on Windows & macOS. Linux: `sudo apt install python3-tk` |
 
-Install dependencies with:
+## Quick Start
 
-```bash
-pip install paramiko tkinterdnd2
+```
+pip install paramiko
+python scp_gui.pyw
 ```
 
-## Configuration
+Click **🔌 Connect**, fill in host/port/username, and either a password or a private key file (leave password blank to use key-only auth).
 
-Before running the application, create a `config.ini` file in the same directory as the script:
+## Interface
 
-```ini
+- **💻 Local (This PC)** — left panel, your machine's filesystem
+- **🌐 Remote [SSH/SCP:22]** — right panel, the remote host's filesystem
+
+Each panel: coloured header with refresh, editable path bar, **↑** up-directory, sortable columns (click header, click again to reverse), status bar, focus-glow border.
+
+## Toolbar
+
+| Button | Action |
+|---|---|
+| 🔌 Connect | Open SSH/SFTP session to the remote host |
+| 🔌 Disconnect | Close the session |
+| ⬆ Upload (PC → Remote) | Upload selected local items |
+| ⬇ Download (Remote → PC) | Download selected remote items |
+| 🗑 Delete | Delete selection in whichever panel last had focus |
+| 📁 New Folder | Create a directory in whichever panel last had focus |
+
+Drag and drop works directly between the two panels. Transfers are recursive for folders, and multi-selection is supported (Click / Shift+Click / Ctrl+Click / Ctrl+A).
+
+## Overwrite Prompt
+
+Yes / Yes to All / No / Cancel — same batch semantics as `proxy_ftp`.
+
+## Configuration — `scp_config.ini`
+
+Created automatically next to `scp_gui.pyw` on first launch:
+
+```
 [ssh]
-host = your.server.com
-port = 22
-username = your_username
-password = your_password
-
-[ui]
-default_remote_path = /home/your_username
+host     =
+port     = 22
+username =
+password =
+keyfile  =
 ```
 
-The `default_remote_path` is optional and defaults to `/` if not specified.
+Uncheck **Remember in INI file** in the connect dialog to connect once without saving.
 
-> **Security note:** Storing passwords in plaintext is convenient for local use but not recommended in shared or production environments. Consider using SSH key authentication via Paramiko's `connect()` method as an alternative.
+> **Security note:** passwords are stored as plain text if remembered. Prefer a key file and leave the password blank.
 
-## Usage
+## Under the hood
 
-Run the application with:
-
-```bash
-python scp_gui.py
-```
-
-Once open, the left pane shows your local filesystem and the right pane shows the remote filesystem. You can:
-
-- **Double-click** a folder to navigate into it, or double-click `..` to go up a level
-- **Select a local file** and click **Upload →** to transfer it to the current remote directory
-- **Select a remote file** and click **← Download** to save it to the current local directory
-- **Drag and drop** files from your desktop onto the application window to upload them
-- **Select a remote file** and click **Delete Remote** to remove it from the server (with confirmation)
-- **Click any column header** to sort the listing by that column; click again to reverse the order
-
-## Project Structure
-
-```
-.
-├── scp_gui.py       # Main application
-└── config.ini       # SSH and UI configuration (you create this)
-```
-
-## Limitations
-
-- Only individual files can be uploaded or downloaded; recursive directory transfer is not currently supported
-- Drag-and-drop only supports uploading (local to remote)
-- Remote file deletion is limited to files; directories cannot be deleted through the UI
-- SSH host key verification is set to auto-accept, which may not be suitable for security-sensitive environments
-
-## Licence
-
-MIT
+All transfers use paramiko's SFTP subsystem over the SSH connection (the same channel `scp` uses) — put/get with progress callbacks, so the two-panel workflow behaves like a graphical `scp`.
