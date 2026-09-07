@@ -39,7 +39,7 @@ Button	Action
 🗑 Delete	Delete selection in whichever panel last had focus
 📁 New Folder	Create a directory in whichever panel last had focus
 ⇄ Compare	Diff the selected local file against the selected remote file
-Drag and drop works directly between the two panels. Transfers are recursive for folders, and multi-selection is supported (Click / Shift+Click / Ctrl+Click / Ctrl+A).
+Drag and drop works directly between the two panels. Transfers are recursive for folders, and multi-selection is supported (Click / Shift+Click / Ctrl+Click / Ctrl+A / Shift+↑ / Shift+↓).
 Compare
 Select exactly one file in each panel (Local and Remote), then click ⇄ Compare. Both files are read in the background — the remote file is streamed straight off the active session (SFTP, SCP-over-SSH, or FTPS), no temp file — and a side-by-side diff window opens, in the style of compfile:
 Synchronized scrolling between the two panes
