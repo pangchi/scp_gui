@@ -821,6 +821,11 @@ class FilePanel(tk.Frame):
         self.tree.bind("<FocusOut>", lambda e: self._set_focus(False))
         self.tree.bind("<Control-a>", lambda e: self._select_all())
         self.tree.bind("<Control-A>", lambda e: self._select_all())
+        self._select_anchor = None
+        self.tree.bind("<Up>", lambda e: self._move_focus(-1, extend=False))
+        self.tree.bind("<Down>", lambda e: self._move_focus(1, extend=False))
+        self.tree.bind("<Shift-Up>", lambda e: self._move_focus(-1, extend=True))
+        self.tree.bind("<Shift-Down>", lambda e: self._move_focus(1, extend=True))
 
         self.status_var = tk.StringVar(value="Not connected")
         tk.Label(self, textvariable=self.status_var, bg=BG, fg=TXT_DIM,
@@ -833,6 +838,36 @@ class FilePanel(tk.Frame):
     def _select_all(self):
         for item in self.tree.get_children():
             self.tree.selection_add(item)
+        children = self.tree.get_children()
+        if children:
+            self._select_anchor = children[0]
+        return "break"
+
+    def _move_focus(self, delta, extend):
+        """Up/Down arrow navigation. extend=True (Shift held) grows/shrinks the
+        selection between a remembered anchor and the newly focused row —
+        the same behaviour as Explorer/Finder — instead of just moving focus."""
+        children = self.tree.get_children()
+        if not children:
+            return "break"
+        current = self.tree.focus()
+        if not current or current not in children:
+            sel = self.tree.selection()
+            current = sel[0] if sel else children[0]
+        idx = children.index(current)
+        new_idx = max(0, min(len(children) - 1, idx + delta))
+        new_item = children[new_idx]
+        if extend:
+            if self._select_anchor is None or self._select_anchor not in children:
+                self._select_anchor = current
+            anchor_idx = children.index(self._select_anchor)
+            lo, hi = sorted((anchor_idx, new_idx))
+            self.tree.selection_set(children[lo:hi + 1])
+        else:
+            self._select_anchor = new_item
+            self.tree.selection_set(new_item)
+        self.tree.focus(new_item)
+        self.tree.see(new_item)
         return "break"
 
     def populate(self, items, path):
@@ -934,6 +969,9 @@ class FilePanel(tk.Frame):
     def _navigate_to(self, path):
         self._nav_callback(path)
 
+    _SHIFT_MASK = 0x0001
+    _CONTROL_MASK = 0x0004
+
     def _on_press(self, event):
         self.tree.focus_set()
         item = self.tree.identify_row(event.y)
@@ -945,6 +983,14 @@ class FilePanel(tk.Frame):
         if self._drag.get("ghost"):
             self._drag["ghost"].destroy()
             self._drag["ghost"] = None
+        if event.state & (self._SHIFT_MASK | self._CONTROL_MASK):
+            # Shift/Ctrl-click is a selection gesture (range-extend / toggle) —
+            # never intercept it for drag-prep, let the Treeview's own
+            # multi-select handling run untouched. Anchor stays as-is so a
+            # following Shift+Arrow keeps extending from the same point.
+            return
+        if item:
+            self._select_anchor = item
         if item and item in self.tree.selection():
             self._drag["deferred"] = True
             return "break"
