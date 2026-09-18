@@ -1362,6 +1362,173 @@ class DiffWindow(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────
+# Terminal window — interactive SSH shell (invoke_shell)
+# Only meaningful for SCP/SFTP connections (SSH); FTPS has no shell.
+# ─────────────────────────────────────────────
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\x08")
+
+# Keysym -> byte sequence sent to the remote pty for keys that don't have a
+# printable character of their own.
+_TERM_KEYSYMS = {
+    "Return": b"\r", "KP_Enter": b"\r",
+    "BackSpace": b"\x7f",
+    "Tab": b"\t",
+    "Escape": b"\x1b",
+    "Up": b"\x1b[A", "Down": b"\x1b[B", "Right": b"\x1b[C", "Left": b"\x1b[D",
+    "Home": b"\x1b[H", "End": b"\x1b[F",
+    "Delete": b"\x1b[3~",
+    "Prior": b"\x1b[5~", "Next": b"\x1b[6~",  # Page Up / Page Down
+}
+
+
+class TerminalWindow(tk.Toplevel):
+    """A minimal but real interactive shell: every keystroke is sent straight to
+    the remote pty and every byte the remote sends back is what gets displayed —
+    the same model a real SSH client uses, so readline history, ctrl-c, tab
+    completion, etc. all work exactly as they would in a normal terminal.
+
+    ANSI color/cursor-movement escapes are stripped before display rather than
+    rendered, so full-screen programs (vim, top, less) won't draw correctly —
+    plain shell use (ls, cd, cat, tail -f, git, systemctl status, ...) works fine.
+    """
+    def __init__(self, parent, ssh_client: paramiko.SSHClient, host_label: str):
+        super().__init__(parent)
+        self.title(f"Terminal — {host_label}")
+        self.geometry("900x560")
+        self.configure(bg=BG)
+        self.minsize(400, 200)
+
+        self._ssh = ssh_client
+        self._channel = None
+        self._q = queue.Queue()
+        self._alive = True
+
+        self._build()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._start_shell()
+        self._poll()
+
+    def _build(self):
+        hdr = tk.Frame(self, bg=BG3)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text=f" 🖥 {self.title()}", bg=BG3, fg="#8fe388",
+                 font=FONT_HDR, anchor="w").pack(side="left", fill="x", expand=True, ipady=4)
+        self._status = tk.Label(hdr, text=" connecting… ", bg=BG3, fg=TXT_DIM, font=FONT_UI)
+        self._status.pack(side="right")
+
+        self.text = tk.Text(self, bg="#0d0f13", fg="#d8dee9", insertbackground="#8fe388",
+                             font=FONT_MONO, relief="flat", borderwidth=0,
+                             wrap="char", undo=False)
+        self.text.pack(fill="both", expand=True)
+        sb = ttk.Scrollbar(self.text, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+
+        self.text.bind("<Key>", self._on_key)
+        self.text.bind("<Button-2>", self._on_middle_paste)   # X11 primary-selection paste
+        self.text.bind("<<Paste>>", self._on_paste)
+        self.text.focus_set()
+
+    # ── Shell lifecycle ──────────────────────────────────────────────────
+    def _start_shell(self):
+        def run():
+            try:
+                chan = self._ssh.invoke_shell(term="xterm", width=120, height=32)
+                chan.settimeout(0.0)
+                self._channel = chan
+                self._q.put(("status", "connected"))
+                buf = b""
+                while self._alive:
+                    try:
+                        data = chan.recv(4096)
+                        if not data:
+                            self._q.put(("status", "closed"))
+                            break
+                        buf += data
+                        text = buf.decode("utf-8", errors="ignore")
+                        buf = b""
+                        self._q.put(("data", text))
+                    except socket.timeout:
+                        pass
+                    except Exception:
+                        break
+                    threading.Event().wait(0.03)
+            except Exception as ex:
+                self._q.put(("error", str(ex)))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _poll(self):
+        try:
+            while True:
+                kind, payload = self._q.get_nowait()
+                if kind == "data":
+                    clean = _ANSI_RE.sub("", payload)
+                    self.text.insert(tk.END, clean)
+                    self.text.see(tk.END)
+                elif kind == "status":
+                    if payload == "connected":
+                        self._status.config(text=" ● connected ", fg="#8fe388")
+                    else:
+                        self._status.config(text=" ● session closed ", fg=ERR)
+                elif kind == "error":
+                    self._status.config(text=" ● error ", fg=ERR)
+                    self.text.insert(tk.END, f"\n[terminal error: {payload}]\n")
+        except queue.Empty:
+            pass
+        if self._alive:
+            self.after(30, self._poll)
+
+    # ── Keyboard → remote pty ────────────────────────────────────────────
+    def _on_key(self, event):
+        if not self._channel:
+            return "break"
+        data = _TERM_KEYSYMS.get(event.keysym)
+        if data is None:
+            if event.char and (event.char.isprintable() or event.char in "\t\r\n"):
+                data = event.char.encode("utf-8", errors="ignore")
+            else:
+                return "break"  # unhandled control/function key — swallow, don't insert locally
+        try:
+            self._channel.send(data)
+        except Exception:
+            pass
+        return "break"  # never let Tk insert locally — the remote echoes back what it received
+
+    def _on_paste(self, event):
+        try:
+            data = self.clipboard_get()
+        except tk.TclError:
+            return "break"
+        if self._channel and data:
+            try:
+                self._channel.send(data.encode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+        return "break"
+
+    def _on_middle_paste(self, event):
+        try:
+            data = self.selection_get(selection="PRIMARY")
+        except tk.TclError:
+            return "break"
+        if self._channel and data:
+            try:
+                self._channel.send(data.encode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+        return "break"
+
+    def _on_close(self):
+        self._alive = False
+        try:
+            if self._channel:
+                self._channel.close()
+        except Exception:
+            pass
+        self.destroy()
+
+
+# ─────────────────────────────────────────────
 # Main Application
 # ─────────────────────────────────────────────
 class ScpGui(tk.Tk):
@@ -1409,6 +1576,8 @@ class ScpGui(tk.Tk):
             (tbtn("📁 New Folder", self._new_folder), "left"),
             (tk.Frame(tb, bg=TXT_DIM, width=1), "left"),
             (tbtn("⇄ Compare", self._compare_selected, "#7fd6ff"), "left"),
+            (tk.Frame(tb, bg=TXT_DIM, width=1), "left"),
+            (tbtn("🖥 Terminal", self._open_terminal, "#8fe388"), "left"),
         ]:
             kw = {"side": side, "padx": 3}
             if isinstance(widget, tk.Frame):
@@ -1914,6 +2083,19 @@ class ScpGui(tk.Tk):
                 self._download_dir(rp, lp, yes_to_all)
             else:
                 self._download_file(rp, lp, yes_to_all)
+
+    # ── Terminal ─────────────────────────────────────────────────────────
+    def _open_terminal(self):
+        if self._protocol == "ftps":
+            messagebox.showinfo("Terminal",
+                                 "Terminal is only available for SCP/SFTP connections (SSH) — "
+                                 "FTPS has no shell access.")
+            return
+        if not self._ssh:
+            messagebox.showinfo("Not connected", "Connect to a remote host first.")
+            return
+        host_label = self._remote_info.get("host", "remote host")
+        TerminalWindow(self, self._ssh, host_label)
 
     # ── Compare ───────────────────────────────────────────────────────────
     def _compare_selected(self):
