@@ -15,7 +15,77 @@ Features:
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import paramiko
+import importlib
+import subprocess
+import sys
+
+
+def _ensure_paramiko():
+    """Import paramiko, pip-installing it first if it's missing.
+
+    This is a .pyw (no console), so progress/errors are shown in small Tk
+    windows rather than printed. Tries a normal install, then --user for
+    environments where site-packages isn't writable.
+    """
+    try:
+        return importlib.import_module("paramiko")
+    except ImportError:
+        pass
+
+    win = tk.Tk()
+    win.title("SCP GUI — first run setup")
+    win.configure(bg="#1a1d23")
+    win.resizable(False, False)
+    tk.Label(win, text="Installing the 'paramiko' package (SSH/SFTP support)…\n"
+                       "This only happens once and may take a moment.",
+             bg="#1a1d23", fg="#e0e6f0", font=("Segoe UI", 10),
+             justify="left").pack(padx=24, pady=20)
+    win.update()
+
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # no flashing console on Windows
+    last_err = ""
+    for extra in ([], ["--user"]):
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--disable-pip-version-check",
+                 *extra, "paramiko"],
+                capture_output=True, text=True, creationflags=flags, timeout=600)
+        except Exception as ex:  # pip missing, timeout, etc.
+            last_err = str(ex)
+            continue
+        if proc.returncode == 0:
+            importlib.invalidate_caches()
+            try:
+                import site
+                user_site = site.getusersitepackages()
+                if user_site not in sys.path:
+                    sys.path.append(user_site)
+            except Exception:
+                pass
+            try:
+                mod = importlib.import_module("paramiko")
+                win.destroy()
+                return mod
+            except ImportError as ex:
+                last_err = str(ex)
+        else:
+            last_err = (proc.stderr or proc.stdout or "").strip()[-600:]
+
+    win.destroy()
+    err_root = tk.Tk()
+    err_root.withdraw()
+    messagebox.showerror(
+        "SCP GUI — missing package",
+        "Couldn't install 'paramiko' automatically.\n\n"
+        "Install it manually, then start the app again:\n\n"
+        f"    {sys.executable} -m pip install paramiko\n\n"
+        f"Details:\n{last_err or 'unknown error'}")
+    err_root.destroy()
+    sys.exit(1)
+
+
+paramiko = _ensure_paramiko()
+
 import os
 import threading
 import stat
@@ -400,6 +470,23 @@ class OverwriteDialog(tk.Toplevel):
         self.configure(bg=BG)
         self.resizable(False, False)
         self.result = OW_NO
+        self.transient(parent)
+
+        # Grey out the main window behind this prompt so it can't be missed:
+        # a borderless, semi-transparent black window laid over the parent.
+        self._dim = None
+        try:
+            parent.update_idletasks()
+            dim = tk.Toplevel(parent)
+            dim.overrideredirect(True)
+            dim.configure(bg="#000000")
+            dim.geometry(f"{parent.winfo_width()}x{parent.winfo_height()}"
+                         f"+{parent.winfo_rootx()}+{parent.winfo_rooty()}")
+            dim.attributes("-alpha", 0.55)
+            dim.bind("<Button-1>", lambda e: (self.bell(), self.focus_force()))
+            self._dim = dim
+        except tk.TclError:
+            self._dim = None  # platform can't do transparency — just show the dialog
 
         tk.Label(self, text=" ⚠ File already exists — overwrite?",
                  bg=BG, fg=ACCENT2, font=FONT_HDR).pack(pady=(14, 4), padx=20, anchor="w")
@@ -419,11 +506,23 @@ class OverwriteDialog(tk.Toplevel):
                       relief="flat", padx=12, pady=4, cursor="hand2",
                       command=lambda v=val: self._pick(v)).pack(side="left", padx=4)
 
+        self.protocol("WM_DELETE_WINDOW", lambda: self._pick(OW_NO))
+        self.update_idletasks()
+        x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2
+        y = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_reqheight()) // 2
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        if self._dim:
+            self._dim.lift()
+        self.lift()
+        self.focus_force()
         self.grab_set()
         self.wait_window()
 
     def _pick(self, val):
         self.result = val
+        if self._dim:
+            self._dim.destroy()
+            self._dim = None
         self.destroy()
 
 
@@ -1551,6 +1650,8 @@ class ScpGui(tk.Tk):
         self._spinner_idx = 0
 
         self._build_ui()
+        self.bind("<F2>", lambda e: self._rename_selected())
+        self.bind("<F5>", lambda e: self._refresh_all())
         self._after_poll()
         self._spin_tick()
 
@@ -2214,6 +2315,64 @@ class ScpGui(tk.Tk):
                 self._post(kind="log", text=f"✗ Delete error ({name}): {ex}", tag="err")
         self._post(kind="refresh_local")
 
+    # ── Rename (F2) / Refresh (F5) ───────────────────────────────────────
+    def _focused_panel(self):
+        focused = self.focus_get()
+        return self.remote_pane if self._widget_in(focused, self.remote_pane) else self.local_pane
+
+    def _refresh_all(self):
+        self.local_pane.refresh()
+        if self._is_connected():
+            self.remote_pane.refresh()
+        return "break"
+
+    def _rename_selected(self):
+        panel = self._focused_panel()
+        names = panel.selected_names()
+        if len(names) != 1:
+            messagebox.showinfo("Rename", "Select exactly one item to rename (F2).")
+            return "break"
+        old_name = names[0]
+        is_remote = panel is self.remote_pane
+        if is_remote and not self._is_connected():
+            messagebox.showinfo("Not connected", "Connect to a remote host first.")
+            return "break"
+        new_name = _ask_string(self, "Rename", f"New name for  {old_name}:", initial=old_name)
+        if not new_name or new_name == old_name:
+            return "break"
+        if "/" in new_name or "\\" in new_name:
+            messagebox.showerror("Rename", "The name can't contain / or \\.")
+            return "break"
+        target = self._rename_remote_thread if is_remote else self._rename_local_thread
+        self._start_worker(target, args=(panel.current_path(), old_name, new_name))
+        return "break"
+
+    def _rename_local_thread(self, path, old_name, new_name):
+        try:
+            dst = os.path.join(path, new_name)
+            if os.path.exists(dst):
+                raise FileExistsError(f"'{new_name}' already exists")
+            os.rename(os.path.join(path, old_name), dst)
+            self._post(kind="log", text=f"✎ Renamed {old_name} → {new_name} (local)", tag="ok")
+        except Exception as ex:
+            self._post(kind="log", text=f"✗ Rename error ({old_name}): {ex}", tag="err")
+        self._post(kind="refresh_local")
+
+    def _rename_remote_thread(self, path, old_name, new_name):
+        try:
+            src = posixpath.join(path, old_name)
+            dst = posixpath.join(path, new_name)
+            if self._remote_exists(dst):
+                raise FileExistsError(f"'{new_name}' already exists")
+            if self._protocol == "ftps":
+                self._ftp.rename(src, dst)
+            else:
+                self._sftp.rename(src, dst)
+            self._post(kind="log", text=f"✎ Renamed {old_name} → {new_name} (remote)", tag="ok")
+        except Exception as ex:
+            self._post(kind="log", text=f"✗ Rename error ({old_name}): {ex}", tag="err")
+        self._post(kind="refresh_remote")
+
     def _new_folder(self):
         focused = self.focus_get()
         panel = self.remote_pane if self._widget_in(focused, self.remote_pane) else self.local_pane
@@ -2252,7 +2411,7 @@ class _Cancelled(Exception):
     pass
 
 
-def _ask_string(parent, title, prompt):
+def _ask_string(parent, title, prompt, initial=""):
     """Small themed replacement for simpledialog.askstring."""
     dlg = tk.Toplevel(parent)
     dlg.title(title)
@@ -2263,6 +2422,11 @@ def _ask_string(parent, title, prompt):
     tk.Label(dlg, text=prompt, bg=BG, fg=TXT, font=FONT_UI).pack(padx=16, pady=(14, 4), anchor="w")
     e = tk.Entry(dlg, bg=BG3, fg=TXT, insertbackground=ACCENT, font=FONT_MONO, relief="flat", bd=4)
     e.pack(padx=16, pady=(0, 10), fill="x", ipady=4)
+    if initial:
+        e.insert(0, initial)
+        # select just the base name (not the extension), like Explorer's rename
+        stem_end = initial.rfind(".") if initial.rfind(".") > 0 else len(initial)
+        e.selection_range(0, stem_end)
     e.focus_set()
 
     def ok(_=None):

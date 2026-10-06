@@ -14,15 +14,16 @@ Same dark UI theme, panel layout, drag-and-drop, and transfer log as `proxy_ftp`
 | Requirement | Notes |
 |---|---|
 | Python 3.10+ | |
-| [paramiko](https://www.paramiko.org/) | `pip install paramiko` — only needed for SCP/SFTP (SSH). FTPS uses the stdlib `ftplib`, no extra install. |
+| [paramiko](https://www.paramiko.org/) | Installed automatically on first launch if missing (see below). Manual: `pip install paramiko`. |
 | Tkinter | Bundled on Windows & macOS. Linux: `sudo apt install python3-tk` |
 
 ## Quick Start
 
 ```
-pip install paramiko
 python scp_gui.pyw
 ```
+
+On first launch, if `paramiko` isn't installed, the app installs it for you (`python -m pip install paramiko`, using the same Python that's running the app) and shows a small "first run setup" window while it works — no console needed, so it also works when started by double-clicking the `.pyw`. If the normal install isn't permitted it retries with `--user`; if that fails too, it shows the exact command to run manually and exits. Tkinter itself can't be auto-installed (on Linux it's a system package — see above).
 
 Click **🔌 Connect**. The dialog remembers **any number of connections**:
 
@@ -83,9 +84,23 @@ The one thing it doesn't do is render ANSI color/cursor-movement escape codes �
 
 Not available for FTPS connections — FTP has no shell access, so the button just explains that instead of trying.
 
+## Keyboard Shortcuts
+
+| Key | Action |
+|---|---|
+| **F2** | Rename the selected item in whichever panel has focus (local, or remote over SFTP/SCP/FTPS). Pre-fills the current name with the base name selected; refuses to overwrite an existing name. |
+| **F5** | Refresh both panels (the remote one only when connected) |
+| **↑ / ↓** | Move the selection |
+| **Shift+↑ / Shift+↓** | Extend the selection |
+| **Ctrl+A** | Select all in the focused panel |
+
+F2 and F5 work in the main window; the Terminal and Compare windows keep their own keys.
+
 ## Overwrite Prompt
 
 Yes / Yes to All / No / Cancel — same batch semantics as `proxy_ftp`.
+
+While the prompt is open the main window is greyed out behind it (a semi-transparent dark layer over the whole window) so it can't be missed, and the dialog is centred on top. Clicking the dimmed area just beeps and returns focus to the prompt. Closing the prompt with the window's X counts as **No**. On platforms that can't do window transparency (some X11 setups without a compositor) the dimming is skipped and only the dialog is shown.
 
 ## Connection Errors
 
