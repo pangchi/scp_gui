@@ -15,6 +15,7 @@ Features:
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from tkinter import font as tkfont
 import importlib
 import subprocess
 import sys
@@ -94,6 +95,7 @@ import posixpath
 import configparser
 import datetime
 import difflib
+import codecs
 import shlex
 import socket
 import ftplib
@@ -1464,7 +1466,144 @@ class DiffWindow(tk.Toplevel):
 # Terminal window — interactive SSH shell (invoke_shell)
 # Only meaningful for SCP/SFTP connections (SSH); FTPS has no shell.
 # ─────────────────────────────────────────────
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[=>]|\x08")
+# ── Terminal screen model ────────────────────────────────────────────────
+# A tiny line-based terminal emulator: it interprets the control characters and
+# escape sequences a shell prompt/readline relies on (backspace, carriage
+# return, erase-to-end-of-line, delete/insert chars, cursor left/right/up/down,
+# clear screen) so that editing a command line looks right. Colours and other
+# styling are parsed and ignored. Pure Python, no Tk — the window just renders
+# whichever lines it marks dirty.
+_TERM_TOKEN_RE = re.compile(
+    r"(\x1b\[([0-?]*)[ -/]*([@-~]))"          # 1: CSI  (params in 2, final in 3)
+    r"|(\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))"   # 4: OSC  (window title etc.) — ignored
+    r"|(\x1b[()][0-9A-Za-z])"                   # 5: charset select — ignored
+    r"|(\x1b[@-Z\\-_=>78])"                    # 6: other 2-char escapes — ignored
+    r"|([\x00-\x1f\x7f])"                      # 7: single control character
+    r"|([^\x00-\x1f\x1b\x7f]+)"                # 8: plain text run
+)
+_TERM_INCOMPLETE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*|\][^\x07\x1b]*\x1b?|[()]?)$")
+
+
+class _TermScreen:
+    def __init__(self, max_lines=5000):
+        self.lines = [""]
+        self.row = 0
+        self.col = 0
+        self.max_lines = max_lines
+        self.dirty = set()
+        self.resync = False      # True -> renderer must redraw everything
+        self.trimmed = 0         # lines dropped from the top since last render
+        self._pending = ""       # an escape sequence split across two reads
+
+    def _mark(self, row=None):
+        self.dirty.add(self.row if row is None else row)
+
+    def _pad(self):
+        line = self.lines[self.row]
+        if self.col > len(line):
+            self.lines[self.row] = line + " " * (self.col - len(line))
+
+    def _put(self, text):
+        self._pad()
+        line = self.lines[self.row]
+        self.lines[self.row] = line[:self.col] + text + line[self.col + len(text):]
+        self.col += len(text)
+        self._mark()
+
+    def _newline(self):
+        self.row += 1
+        if self.row >= len(self.lines):
+            self.lines.append("")
+        self._mark()
+        if len(self.lines) > self.max_lines:
+            n = len(self.lines) - self.max_lines
+            self.lines = self.lines[n:]
+            self.row = max(0, self.row - n)
+            self.dirty = {d - n for d in self.dirty if d >= n}
+            self.trimmed += n
+
+    def _clear_all(self):
+        self.lines = [""]
+        self.row = self.col = 0
+        self.dirty.clear()
+        self.trimmed = 0
+        self.resync = True
+
+    def _csi(self, params, final):
+        nums = [int(x) if x.isdigit() else 0 for x in params.split(";")] if params else []
+        n = nums[0] if nums and nums[0] > 0 else 1
+        arg0 = nums[0] if nums else 0
+        if params.startswith("?") or params.startswith(">"):
+            return  # private modes (bracketed paste, cursor visibility, ...) — ignored
+        if final == "K":                       # erase in line
+            line = self.lines[self.row]
+            if arg0 == 0:
+                self.lines[self.row] = line[:self.col]
+            elif arg0 == 1:
+                self.lines[self.row] = " " * min(self.col + 1, len(line)) + line[self.col + 1:]
+            else:
+                self.lines[self.row] = ""
+            self._mark()
+        elif final == "P":                     # delete n characters
+            line = self.lines[self.row]
+            self.lines[self.row] = line[:self.col] + line[self.col + n:]
+            self._mark()
+        elif final == "@":                     # insert n blanks
+            self._pad()
+            line = self.lines[self.row]
+            self.lines[self.row] = line[:self.col] + " " * n + line[self.col:]
+            self._mark()
+        elif final == "X":                     # erase n characters (blank them)
+            self._pad()
+            line = self.lines[self.row]
+            self.lines[self.row] = line[:self.col] + " " * n + line[self.col + n:]
+            self._mark()
+        elif final == "C":
+            self.col += n
+        elif final == "D":
+            self.col = max(0, self.col - n)
+        elif final == "G":
+            self.col = max(0, n - 1)
+        elif final == "A":
+            self.row = max(0, self.row - n)
+        elif final == "B":
+            self.row = min(len(self.lines) - 1, self.row + n)
+        elif final == "J":
+            if arg0 in (2, 3):
+                self._clear_all()
+            elif arg0 == 0:
+                line = self.lines[self.row]
+                self.lines[self.row] = line[:self.col]
+                if len(self.lines) > self.row + 1:
+                    del self.lines[self.row + 1:]
+                    self.resync = True
+                self._mark()
+        # everything else ("m" colours, "H" absolute moves, "r", "h"/"l", ...) is ignored
+
+    def feed(self, data):
+        s = self._pending + data
+        self._pending = ""
+        m = _TERM_INCOMPLETE_RE.search(s)
+        if m:
+            self._pending = s[m.start():]
+            s = s[:m.start()]
+        for tok in _TERM_TOKEN_RE.finditer(s):
+            if tok.group(1):
+                self._csi(tok.group(2), tok.group(3))
+            elif tok.group(7):
+                c = tok.group(7)
+                if c == "\r":
+                    self.col = 0
+                elif c in "\n\x0b\x0c":
+                    self._newline()
+                elif c in "\x08\x7f":
+                    self.col = max(0, self.col - 1)
+                elif c == "\t":
+                    self.col = (self.col // 8 + 1) * 8
+                # \x07 (bell) and the rest: ignored
+            elif tok.group(8):
+                self._put(tok.group(8))
+# ── end terminal screen model ────────────────────────────────────────────
 
 # Keysym -> byte sequence sent to the remote pty for keys that don't have a
 # printable character of their own.
@@ -1486,8 +1625,10 @@ class TerminalWindow(tk.Toplevel):
     the same model a real SSH client uses, so readline history, ctrl-c, tab
     completion, etc. all work exactly as they would in a normal terminal.
 
-    ANSI color/cursor-movement escapes are stripped before display rather than
-    rendered, so full-screen programs (vim, top, less) won't draw correctly —
+    Output goes through a small line-based screen model (_TermScreen): backspace,
+    carriage return, erase-line, delete/insert-char and cursor moves are applied
+    for real, so editing a command line works. Colours are parsed and ignored,
+    and full-screen programs (vim, top, less) still won't draw correctly —
     plain shell use (ls, cd, cat, tail -f, git, systemctl status, ...) works fine.
     """
     def __init__(self, parent, ssh_client: paramiko.SSHClient, host_label: str):
@@ -1501,6 +1642,8 @@ class TerminalWindow(tk.Toplevel):
         self._channel = None
         self._q = queue.Queue()
         self._alive = True
+        self._screen = _TermScreen()
+        self._resize_job = None
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1526,6 +1669,11 @@ class TerminalWindow(tk.Toplevel):
         self.text.bind("<Key>", self._on_key)
         self.text.bind("<Button-2>", self._on_middle_paste)   # X11 primary-selection paste
         self.text.bind("<<Paste>>", self._on_paste)
+        for seq in ("<Control-v>", "<Control-V>", "<Control-Shift-V>", "<Shift-Insert>"):
+            self.text.bind(seq, self._on_paste)
+        for seq in ("<Control-Shift-C>", "<Control-Shift-c>"):
+            self.text.bind(seq, self._on_copy)
+        self.text.bind("<Configure>", self._on_resize)
         self.text.focus_set()
 
     # ── Shell lifecycle ──────────────────────────────────────────────────
@@ -1536,17 +1684,18 @@ class TerminalWindow(tk.Toplevel):
                 chan.settimeout(0.0)
                 self._channel = chan
                 self._q.put(("status", "connected"))
-                buf = b""
+                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                 while self._alive:
                     try:
                         data = chan.recv(4096)
                         if not data:
                             self._q.put(("status", "closed"))
                             break
-                        buf += data
-                        text = buf.decode("utf-8", errors="ignore")
-                        buf = b""
-                        self._q.put(("data", text))
+                        # incremental decoder keeps a multi-byte character that
+                        # was split across two reads instead of mangling it
+                        text = decoder.decode(data)
+                        if text:
+                            self._q.put(("data", text))
                     except socket.timeout:
                         pass
                     except Exception:
@@ -1557,13 +1706,13 @@ class TerminalWindow(tk.Toplevel):
         threading.Thread(target=run, daemon=True).start()
 
     def _poll(self):
+        got_data = False
         try:
             while True:
                 kind, payload = self._q.get_nowait()
                 if kind == "data":
-                    clean = _ANSI_RE.sub("", payload)
-                    self.text.insert(tk.END, clean)
-                    self.text.see(tk.END)
+                    self._screen.feed(payload)
+                    got_data = True
                 elif kind == "status":
                     if payload == "connected":
                         self._status.config(text=" ● connected ", fg="#8fe388")
@@ -1574,8 +1723,66 @@ class TerminalWindow(tk.Toplevel):
                     self.text.insert(tk.END, f"\n[terminal error: {payload}]\n")
         except queue.Empty:
             pass
+        if got_data:
+            self._render()
         if self._alive:
             self.after(30, self._poll)
+
+    def _render(self):
+        """Apply whatever the screen model changed to the Text widget."""
+        sc = self._screen
+        at_bottom = self.text.yview()[1] >= 0.999
+        widget_lines = int(self.text.index("end-1c").split(".")[0])
+        if sc.resync or sc.trimmed >= widget_lines:
+            self.text.delete("1.0", tk.END)
+            self.text.insert("1.0", "\n".join(sc.lines))
+            sc.resync = False
+            sc.trimmed = 0
+            sc.dirty.clear()
+        else:
+            if sc.trimmed:
+                self.text.delete("1.0", f"{sc.trimmed + 1}.0")
+                widget_lines -= sc.trimmed
+                sc.trimmed = 0
+            while widget_lines < len(sc.lines):
+                self.text.insert(tk.END, "\n")
+                widget_lines += 1
+            for i in sorted(sc.dirty):
+                if i < len(sc.lines):
+                    self.text.delete(f"{i + 1}.0", f"{i + 1}.end")
+                    self.text.insert(f"{i + 1}.0", sc.lines[i])
+            sc.dirty.clear()
+        self.text.mark_set("insert", f"{sc.row + 1}.{sc.col}")
+        if at_bottom:
+            self.text.see("insert")
+
+    def _on_resize(self, _event=None):
+        # Tell the remote pty how big the window really is so readline wraps
+        # long command lines at the right column. Debounced.
+        if self._resize_job:
+            self.after_cancel(self._resize_job)
+        self._resize_job = self.after(250, self._send_resize)
+
+    def _send_resize(self):
+        self._resize_job = None
+        if not self._channel:
+            return
+        try:
+            f = tkfont.Font(font=self.text.cget("font"))
+            cols = max(20, self.text.winfo_width() // max(1, f.measure("0")))
+            rows = max(5, self.text.winfo_height() // max(1, f.metrics("linespace")))
+            self._channel.resize_pty(width=cols, height=rows)
+        except Exception:
+            pass
+
+    def _on_copy(self, _event=None):
+        try:
+            sel = self.text.get("sel.first", "sel.last")
+        except tk.TclError:
+            return "break"
+        self.clipboard_clear()
+        self.clipboard_append(sel)
+        return "break"
 
     # ── Keyboard → remote pty ────────────────────────────────────────────
     def _on_key(self, event):
@@ -1583,10 +1790,12 @@ class TerminalWindow(tk.Toplevel):
             return "break"
         data = _TERM_KEYSYMS.get(event.keysym)
         if data is None:
-            if event.char and (event.char.isprintable() or event.char in "\t\r\n"):
-                data = event.char.encode("utf-8", errors="ignore")
+            ch = event.char
+            if ch and (ch.isprintable() or (len(ch) == 1 and ord(ch) < 32)):
+                # printable text, and Ctrl+letter combos (Ctrl+C = \x03, Ctrl+D = \x04, ...)
+                data = ch.encode("utf-8", errors="ignore")
             else:
-                return "break"  # unhandled control/function key — swallow, don't insert locally
+                return "break"  # unhandled function/modifier key — swallow, don't insert locally
         try:
             self._channel.send(data)
         except Exception:

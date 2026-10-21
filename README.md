@@ -80,7 +80,15 @@ Only text files are supported, and each file is capped at 20 MB for the in-memor
 
 Click **🖥 Terminal** while connected over SCP or SFTP to open an interactive shell on the remote host, in its own window. It's a real terminal, not a command box: every keystroke is sent straight to the remote pty over its own SSH channel (opened alongside the SFTP session — they don't interfere with each other), and everything the remote sends back is what gets displayed. That means readline history (↑/↓), tab completion, Ctrl+C, `less`/`tail -f`, and anything else a normal SSH session supports all work the same way here.
 
-The one thing it doesn't do is render ANSI color/cursor-movement escape codes — they're stripped before display rather than interpreted, so plain shell use (`ls`, `cd`, `cat`, `git status`, `systemctl status`, `tail -f`, …) looks right, but full-screen programs that repaint the screen in place (`vim`, `top`, `less` in its default full-screen mode) won't draw correctly. `less -F` (quit-if-one-screen) or piping through `cat` instead avoids that.
+Output is run through a small built-in terminal screen model rather than just printed, so command-line editing looks right: **backspace**, **Delete**, ←/→ editing in the middle of a line, history recall, Ctrl+U/Ctrl+K/Ctrl+W, and `clear` all redraw correctly. Colours and other styling codes are understood and ignored (the text shows in one colour). The remote pty is resized to match the window, so long command lines wrap at the right place. Scrollback is capped at 5,000 lines.
+
+| Key | Action |
+|---|---|
+| **Ctrl+C / Ctrl+D / Ctrl+L / Ctrl+Z …** | Sent to the remote as the usual control characters |
+| **Ctrl+V** / **Shift+Insert** / **Ctrl+Shift+V** | Paste (middle-click pastes the X11 selection) |
+| **Ctrl+Shift+C** | Copy the selected text |
+
+What it doesn't do: full-screen programs that repaint the whole screen in place (`vim`, `top`, `htop`, `less` in its default full-screen mode) won't draw correctly, since there's no 2-D screen buffer or absolute cursor addressing. `less -F` (quit-if-one-screen) or piping through `cat` avoids that; plain shell use (`ls`, `cd`, `cat`, `git status`, `systemctl status`, `tail -f`, …) is fine.
 
 Not available for FTPS connections — FTP has no shell access, so the button just explains that instead of trying.
 
